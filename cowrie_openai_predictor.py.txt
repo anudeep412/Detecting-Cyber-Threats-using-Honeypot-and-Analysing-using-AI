@@ -1,0 +1,522 @@
+import os
+from openai import OpenAI
+import json
+import time
+import re
+import requests
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+# === CONFIG ===
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # Use environment variable for security
+if not OPENAI_API_KEY:
+    print("Error: OPENAI_API_KEY environment variable not set!")
+    print("   Set it with: export OPENAI_API_KEY='your-api-key-here'")
+    exit(1)
+
+LOG_FILE_PATH = "/etc/cowrie/var/log/cowrie/cowrie.json"
+BACKEND_API_URL = "http://localhost:8000/api/logs"
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Track last processed position in file
+last_position = 0
+processed_entries = set()
+
+# === OpenAI Call ===
+def predict_mitre_technique(log_entry):
+    # Extract command for better analysis
+    command = ""
+    if "COMMAND:" in log_entry:
+        command = log_entry.split("COMMAND:")[1].split("|")[0].strip()
+
+    prompt = f"""You are a cybersecurity expert analyzing honeypot logs. Based on the command executed, identify the most specific MITRE ATT&CK technique.
+
+Command executed: {command}
+Full log context: {log_entry}
+
+Common honeypot commands and their MITRE mappings:
+- ls, dir, find, locate → T1083 (File and Directory Discovery)
+- whoami, id, groups → T1033 (System Owner/User Discovery)
+- ps, top, tasklist → T1057 (Process Discovery)
+- netstat, ss, lsof → T1049 (System Network Connections Discovery)
+- cat, type, more, less → T1005 (Data from Local System)
+- wget, curl, download → T1105 (Ingress Tool Transfer)
+- chmod, chown, icacls → T1222 (File and Directory Permissions Modification)
+- uname, systeminfo → T1082 (System Information Discovery)
+- history → T1552 (Unsecured Credentials)
+- bash, sh, cmd, powershell → T1059 (Command and Scripting Interpreter)
+
+You must respond with ONLY a valid JSON object in this exact format:
+{{
+    "mitre_technique": "T1XXX",
+    "technique_name": "Technique Name",
+    "severity": "LOW|MEDIUM|HIGH|CRITICAL",
+    "description": "Brief description of what this command does",
+    "confidence": 85,
+    "analysis": "Detailed reasoning for classification",
+    "indicators": ["specific", "indicators", "found"],
+    "risk_level": "LOW|MEDIUM|HIGH|CRITICAL",
+    "attack_stage": "reconnaissance|initial_access|execution|persistence|defense_evasion|credential_access|discovery|lateral_movement|collection|exfiltration|impact",
+    "threat_score": 75,
+    "recommended_action": "monitor|investigate|block|immediate_response",
+    "false_positive_likelihood": "low|medium|high"
+}}"""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Use mini for cost efficiency
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=400
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"❌ OpenAI API Error: {str(e)}")
+        return None
+
+# === Parse OpenAI Output ===
+def parse_openai_response(text):
+    if not text:
+        return None
+
+    print(f"🔍 Parsing OpenAI response: {text[:200]}...")
+
+    try:
+        # Try to extract JSON from response
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group()
+            analysis = json.loads(json_str)
+
+            # Validate required fields and provide defaults
+            required_fields = {
+                'mitre_technique': 'T1190',
+                'technique_name': 'Unknown Technique',
+                'severity': 'MEDIUM',
+                'description': 'Suspicious activity detected',
+                'confidence': 70,
+                'analysis': text,
+                'indicators': [],
+                'risk_level': 'MEDIUM',
+                'attack_stage': 'reconnaissance',
+                'threat_score': 50,
+                'recommended_action': 'investigate',
+                'false_positive_likelihood': 'medium'
+            }
+
+            for field, default in required_fields.items():
+                if field not in analysis:
+                    analysis[field] = default
+
+            # Ensure proper data types
+            analysis['confidence'] = int(analysis.get('confidence', 70))
+            analysis['threat_score'] = int(analysis.get('threat_score', 50))
+
+            if not isinstance(analysis['indicators'], list):
+                analysis['indicators'] = [str(analysis['indicators'])] if analysis['indicators'] else []
+
+            print(f"✅ Successfully parsed: {analysis['mitre_technique']} - {analysis['technique_name']}")
+            return analysis
+
+    except json.JSONDecodeError as e:
+        print(f"❌ JSON Parsing Error: {str(e)}")
+    except Exception as e:
+        print(f"❌ Parsing Error: {str(e)}")
+
+    print("⚠️ Using fallback parsing")
+
+    # Fallback parsing
+    technique_match = re.search(r'(T\d{4}(?:\.\d{3})?)', text)
+    technique = technique_match.group(1) if technique_match else "T1190"
+
+    return {
+        "mitre_technique": technique,
+        "technique_name": "Command and Scripting Interpreter",
+        "severity": "MEDIUM",
+        "description": "Command execution detected via fallback parsing",
+        "confidence": 50,
+        "analysis": text[:200] + "..." if len(text) > 200 else text,
+        "indicators": ["command_execution"],
+        "risk_level": "MEDIUM",
+        "attack_stage": "execution",
+        "threat_score": 50,
+        "recommended_action": "monitor",
+        "false_positive_likelihood": "high"
+    }
+
+# === Pre-classify Common Commands ===
+def preclassify_command(cmd):
+    """Pre-classify common honeypot commands for better accuracy and cost savings"""
+    cmd_lower = cmd.lower().strip()
+
+    # File and Directory Discovery
+    if any(c in cmd_lower for c in ['ls', 'dir', 'find', 'locate', 'tree']):
+        return {
+            "mitre_technique": "T1083",
+            "technique_name": "File and Directory Discovery",
+            "severity": "LOW",
+            "description": f"Directory listing or file discovery using '{cmd}'",
+            "confidence": 95,
+            "analysis": f"Pre-classified common reconnaissance command: {cmd}",
+            "indicators": [cmd.strip()],
+            "risk_level": "LOW",
+            "attack_stage": "discovery",
+            "threat_score": 25,
+            "recommended_action": "monitor",
+            "false_positive_likelihood": "low"
+        }
+
+    # System Owner/User Discovery
+    elif any(c in cmd_lower for c in ['whoami', 'id', 'groups', 'who']):
+        return {
+            "mitre_technique": "T1033",
+            "technique_name": "System Owner/User Discovery",
+            "severity": "MEDIUM",
+            "description": f"User enumeration using '{cmd}'",
+            "confidence": 95,
+            "analysis": f"Pre-classified user discovery command: {cmd}",
+            "indicators": [cmd.strip()],
+            "risk_level": "MEDIUM",
+            "attack_stage": "discovery",
+            "threat_score": 45,
+            "recommended_action": "investigate",
+            "false_positive_likelihood": "low"
+        }
+
+    # Process Discovery
+    elif any(c in cmd_lower for c in ['ps', 'top', 'tasklist', 'htop']):
+        return {
+            "mitre_technique": "T1057",
+            "technique_name": "Process Discovery",
+            "severity": "MEDIUM",
+            "description": f"Process enumeration using '{cmd}'",
+            "confidence": 95,
+            "analysis": f"Pre-classified process discovery command: {cmd}",
+            "indicators": [cmd.strip()],
+            "risk_level": "MEDIUM",
+            "attack_stage": "discovery",
+            "threat_score": 50,
+            "recommended_action": "investigate",
+            "false_positive_likelihood": "low"
+        }
+
+    # System Network Connections Discovery
+    elif any(c in cmd_lower for c in ['netstat', 'ss', 'lsof', 'netsh']):
+        return {
+            "mitre_technique": "T1049",
+            "technique_name": "System Network Connections Discovery",
+            "severity": "MEDIUM",
+            "description": f"Network connection discovery using '{cmd}'",
+            "confidence": 95,
+            "analysis": f"Pre-classified network discovery command: {cmd}",
+            "indicators": [cmd.strip()],
+            "risk_level": "MEDIUM",
+            "attack_stage": "discovery",
+            "threat_score": 55,
+            "recommended_action": "investigate",
+            "false_positive_likelihood": "low"
+        }
+
+    # Ingress Tool Transfer - HIGH RISK
+    elif any(c in cmd_lower for c in ['wget', 'curl', 'download', 'scp', 'ftp']):
+        return {
+            "mitre_technique": "T1105",
+            "technique_name": "Ingress Tool Transfer",
+            "severity": "HIGH",
+            "description": f"File download/transfer attempt using '{cmd}'",
+            "confidence": 98,
+            "analysis": f"Pre-classified file transfer command: {cmd}",
+            "indicators": [cmd.strip()],
+            "risk_level": "HIGH",
+            "attack_stage": "resource_development",
+            "threat_score": 80,
+            "recommended_action": "investigate",
+            "false_positive_likelihood": "low"
+        }
+
+    # System Information Discovery
+    elif any(c in cmd_lower for c in ['uname', 'systeminfo', 'hostname', 'uptime']):
+        return {
+            "mitre_technique": "T1082",
+            "technique_name": "System Information Discovery",
+            "severity": "LOW",
+            "description": f"System information gathering using '{cmd}'",
+            "confidence": 95,
+            "analysis": f"Pre-classified system info command: {cmd}",
+            "indicators": [cmd.strip()],
+            "risk_level": "LOW",
+            "attack_stage": "discovery",
+            "threat_score": 30,
+            "recommended_action": "monitor",
+            "false_positive_likelihood": "low"
+        }
+
+    return None  # No pre-classification available
+
+# === Process New Log Entries ===
+def process_new_log_entries():
+    global last_position
+
+    # Wait a bit to ensure file writing is complete
+    time.sleep(0.1)
+
+    try:
+        with open(LOG_FILE_PATH, 'r') as f:
+            f.seek(last_position)
+            content = f.read()
+
+            if not content:
+                return
+
+            lines = content.split('\n')
+
+            # Handle incomplete lines
+            if content and not content.endswith('\n'):
+                incomplete_line = lines[-1]
+                lines = lines[:-1]
+                last_position = f.tell() - len(incomplete_line.encode('utf-8'))
+            else:
+                last_position = f.tell()
+
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    log_data = json.loads(line)
+
+                    if log_data.get('eventid') == 'cowrie.command.input':
+                        process_command_log(log_data)
+
+                except json.JSONDecodeError as e:
+                    if line.startswith('{') and len(line) > 20:
+                        print(f"⚠️ JSON Decode Error: {str(e)} for line: {line[:100]}...")
+                    continue
+
+    except FileNotFoundError:
+        print(f"❌ Log file not found: {LOG_FILE_PATH}")
+    except Exception as e:
+        print(f"❌ Error reading log file: {str(e)}")
+
+# === Process Individual Command Log ===
+def process_command_log(log_data):
+    cmd = log_data.get('input', '')
+    src_ip = log_data.get('src_ip', 'Unknown')
+    timestamp = log_data.get('timestamp', 'Unknown')
+    session_id = log_data.get('session', 'Unknown')
+
+    if not cmd.strip():
+        return
+
+    # Create unique identifier and check for duplicates
+    log_id = f"{timestamp}_{session_id}_{hash(cmd)}"
+
+    if log_id in processed_entries:
+        print(f"⚠️ Skipping duplicate command: {cmd}")
+        return
+
+    processed_entries.add(log_id)
+
+    # Clean up old entries
+    if len(processed_entries) > 1000:
+        old_entries = list(processed_entries)[:100]
+        for entry in old_entries:
+            processed_entries.discard(entry)
+
+    full_log = f"COMMAND: {cmd} | Source IP: {src_ip} | Time: {timestamp} | Session: {session_id}"
+
+    print(f"\n🛡️  Analyzing command: '{cmd}'")
+    print(f"📍 Source IP: {src_ip}")
+    print(f"🕒 Timestamp: {timestamp}")
+
+    # Try pre-classification first (saves money!)
+    preclass_result = preclassify_command(cmd)
+    if preclass_result:
+        print(f"💰 Pre-classified as: {preclass_result['mitre_technique']} - {preclass_result['technique_name']}")
+
+        post_data = {
+            "log_data": full_log,
+            "source_ip": src_ip,
+            "command": cmd,
+            "timestamp": timestamp,
+            "session_id": session_id,
+            "event_type": "command.input",
+            "gpt_analysis": preclass_result  # CRITICAL: This is what backend expects
+        }
+        send_to_backend(post_data)
+        return
+
+    # Use OpenAI for unknown commands
+    print(" Sending to OpenAI for analysis...")
+    raw_result = predict_mitre_technique(full_log)
+
+    if not raw_result:
+        print(" No result from OpenAI")
+        return
+
+    print(f"\n Raw GPT Response:\n{raw_result}")
+
+    parsed_result = parse_openai_response(raw_result)
+
+    if parsed_result:
+        print(f" Final classification: {parsed_result['mitre_technique']} - {parsed_result['technique_name']}")
+        print(f"🚨 Severity: {parsed_result['severity']}")
+
+        post_data = {
+            "log_data": full_log,
+            "source_ip": src_ip,
+            "command": cmd,
+            "timestamp": timestamp,
+            "session_id": session_id,
+            "event_type": "command.input",
+            "gpt_analysis": parsed_result  # CRITICAL: This is what backend expects
+        }
+
+        send_to_backend(post_data)
+    else:
+        print("⚠️ Could not parse GPT result.")
+
+# === Send Data to Backend ===
+def send_to_backend(post_data):
+    try:
+        print(f"📤 Sending to backend: {post_data['gpt_analysis']['mitre_technique']} - {post_data['gpt_analysis']['technique_name']}")
+
+        res = requests.post(
+            BACKEND_API_URL,
+            json=post_data,
+            timeout=10,
+            headers={'Content-Type': 'application/json'}
+        )
+
+        if res.status_code == 200:
+            try:
+                response_data = res.json()
+                if response_data.get('cost_saved'):
+                    print(f" Successfully sent to dashboard ( Cost saved!)")
+                else:
+                    print(f" Successfully sent to dashboard ( Backend analysis used)")
+
+                analysis_source = response_data.get('analysis_source', 'unknown')
+                print(f" Analysis source: {analysis_source}")
+
+            except:
+                print(f" Successfully sent to dashboard")
+        else:
+            print(f" Backend responded with status {res.status_code}")
+            print(f"Response: {res.text}")
+
+    except requests.exceptions.Timeout:
+        print(" Timeout sending to backend (>10s)")
+    except requests.exceptions.ConnectionError:
+        print(" Connection error - is your backend server running?")
+        print(f" Trying to connect to: {BACKEND_API_URL}")
+    except Exception as e:
+        print(f" Failed to send to backend: {e}")
+
+# === Initialize File Position ===
+def initialize_file_position():
+    global last_position
+    try:
+        with open(LOG_FILE_PATH, 'r') as f:
+            f.seek(0, 2)  # Go to end
+            last_position = f.tell()
+            print(f"📍 Starting from file position: {last_position}")
+
+            # Process a few recent entries for testing
+            f.seek(max(0, last_position - 2000))
+            recent_content = f.read()
+
+            if recent_content:
+                lines = recent_content.strip().split('\n')
+                processed_count = 0
+
+                for line in reversed(lines[-5:]):
+                    line = line.strip()
+                    if not line or not line.startswith('{'):
+                        continue
+
+                    try:
+                        log_data = json.loads(line)
+                        if log_data.get('eventid') == 'cowrie.command.input':
+                            print(f"🔍 Found recent command: {log_data.get('input', 'N/A')}")
+                            processed_count += 1
+                            if processed_count >= 1:
+                                break
+                    except json.JSONDecodeError:
+                        continue
+
+            f.seek(0, 2)
+            last_position = f.tell()
+
+    except FileNotFoundError:
+        print(f" Log file not found: {LOG_FILE_PATH}")
+        last_position = 0
+
+# === Log Monitor Handler ===
+class CowrieLogHandler(FileSystemEventHandler):
+    def __init__(self):
+        super().__init__()
+        self.last_modified = 0
+        self.debounce_time = 0.5
+
+    def on_modified(self, event):
+        if event.src_path == LOG_FILE_PATH:
+            current_time = time.time()
+            if current_time - self.last_modified < self.debounce_time:
+                return
+
+            self.last_modified = current_time
+            print(f"🔄 Log file modified, processing new entries...")
+            process_new_log_entries()
+
+# === Main Runner ===
+if __name__ == "__main__":
+    print("🚀 Starting Cowrie log monitor with MITRE predictions via OpenAI...")
+
+    # Test OpenAI connection
+    print("🔐 Testing OpenAI API connection...")
+    try:
+        test_response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "Say 'API test successful'"}],
+            max_tokens=10
+        )
+        print("OpenAI API connection successful")
+    except Exception as e:
+        print(f" OpenAI API test failed: {str(e)}")
+        exit(1)
+
+    # Test backend connection
+    print(" Testing backend connection...")
+    try:
+        test_req = requests.get(BACKEND_API_URL.replace('/api/logs', '/api/health'), timeout=5)
+        health = test_req.json()
+        print(f" Backend connection successful - Status: {health.get('status')}")
+        print(f"Backend OpenAI Status: {health.get('openai', {}).get('status')}")
+    except:
+        print("⚠️ Backend connection failed - continuing anyway")
+
+    initialize_file_position()
+
+    event_handler = CowrieLogHandler()
+    observer = Observer()
+
+    log_dir = os.path.dirname(LOG_FILE_PATH)
+    observer.schedule(event_handler, path=log_dir, recursive=False)
+    observer.start()
+
+    print(f" Monitoring {LOG_FILE_PATH} for new entries...")
+    print(" Trigger some commands in your honeypot to see analysis!")
+    print( "Common commands (ls, whoami, ps) will be pre-classified to save costs")
+    print(" Press Ctrl+C to stop")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n Stopping monitor...")
+        observer.stop()
+    observer.join()
+    print(" Monitor stopped")

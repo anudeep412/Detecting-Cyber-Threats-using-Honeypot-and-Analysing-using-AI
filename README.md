@@ -3,7 +3,7 @@
 ## Master's Thesis Project
 
 **Master of Engineering in Cyber Security**
-University of Limerick
+ | University of Limerick
 
 ---
 

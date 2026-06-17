@@ -182,7 +182,7 @@ bin/cowrie start
 
 ## Main Dashboard Overview
 
-![Dashboard Overview](images/Web%20Dashboard.png)
+![Dashboard Overview](Images/Web%20Dashboard.png)
 
 Provides a consolidated view of attack activity, threat severity, and session statistics.
 
